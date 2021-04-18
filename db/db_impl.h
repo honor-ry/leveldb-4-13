@@ -1,4 +1,4 @@
-// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
+﻿// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
@@ -8,6 +8,7 @@
 #include <atomic>
 #include <deque>
 #include <set>
+#include <map>
 #include <string>
 
 #include "db/dbformat.h"
@@ -25,6 +26,9 @@ class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
+class MemVersionSet;
+class MemVersion;
+class MemVersionEdit;
 
 class DBImpl : public DB {
  public:
@@ -34,7 +38,7 @@ class DBImpl : public DB {
   DBImpl& operator=(const DBImpl&) = delete;
 
   ~DBImpl() override;
-
+  void ShowTables();
   // Implementations of the DB interface
   Status Put(const WriteOptions&, const Slice& key,
              const Slice& value) override;
@@ -117,12 +121,13 @@ class DBImpl : public DB {
 
   // Delete any unneeded files and stale in-memory entries.
   void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-
+  void RemoveObsoleteTables() EXCLUSIVE_LOCKS_REQUIRED(mutex_);//unref obsolete tables
   // Compact the in-memory write buffer to disk.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
   // Errors are recorded in bg_error_.
   void CompactMemTable() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-
+  void DiskFlush() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  
   Status RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest,
                         VersionEdit* edit, SequenceNumber* max_sequence)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -138,9 +143,12 @@ class DBImpl : public DB {
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-  static void BGWork(void* db);
-  void BackgroundCall();
-  void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void MaybeScheduleMemCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  
+  static void BGWork(void* db,bool is_mem);
+  void BackgroundCall(bool is_mem);
+  void BackgroundCompaction(bool is_mem) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWork(CompactionState* compact)
@@ -150,6 +158,13 @@ class DBImpl : public DB {
   Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+//
+  void RecordMemTable(MemTable* mem, MemVersionEdit* edit);    
+  Status DoMemCompactionWork(CompactionState* compact);
+  void CleanupMemCompaction(CompactionState* compact);
+  void OpenCompactionOutputTable(CompactionState* compact);
+  void FinishCompactionOutputTable(CompactionState* compact);
+  void InstallMemCompactionResults(CompactionState* compact) ;
 
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();
@@ -172,8 +187,11 @@ class DBImpl : public DB {
 
   // State below is protected by mutex_
   port::Mutex mutex_;
+  port::Mutex thread_mutex_;//内存和磁盘线程的同步量
+
   std::atomic<bool> shutting_down_;
   port::CondVar background_work_finished_signal_ GUARDED_BY(mutex_);
+  port::CondVar background_mem_work_finished_signal_ GUARDED_BY(mutex_);
   MemTable* mem_;
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
   std::atomic<bool> has_imm_;         // So bg thread can detect non-null imm_
@@ -181,6 +199,7 @@ class DBImpl : public DB {
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
+
 
   // Queue of writers.
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);
@@ -191,13 +210,17 @@ class DBImpl : public DB {
   // Set of table files to protect from deletion because they are
   // part of ongoing compactions.
   std::set<uint64_t> pending_outputs_ GUARDED_BY(mutex_);
+  std::set<uint64_t> mem_pending_outputs_ GUARDED_BY(mutex_);
+  std::map<uint64_t,MemTable *> all_memtables_ GUARDED_BY(mutex_);//所有memtable的指针，用于释放内存
 
   // Has a background compaction been scheduled or is running?
   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+  bool background_compaction_scheduled_mem_ GUARDED_BY(mutex_);
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
   VersionSet* const versions_ GUARDED_BY(mutex_);
+  MemVersionSet* const m_versions_ GUARDED_BY(mutex_);//mem vset
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
